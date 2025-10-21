@@ -1,15 +1,26 @@
 #!/bin/bash
+# =====================================================================
+# Title: deploy.sh
+# Purpose: Automate setup, deployment, and configuration of a Dockerized app
+# Author: DevOps Intern (HNG Project)
+# Description:
+#   This script automates the full CI/CD workflow for a Dockerized
+#   application from GitHub to a remote Linux server, including:
+#   - Repository cloning or update
+#   - Docker & Nginx setup
+#   - Container deployment
+#   - Nginx reverse proxy configuration
+#   - Logging, error handling, and cleanup
+# =====================================================================
 
-# ==============================================
-# Simple Automated Docker App Deployment Script
-# ==============================================
-# Author: New DevOps Intern
-# Purpose: Automate setup and deployment of a Dockerized app to a remote server
-# ==============================================
+# Exit on any error
+set -euo pipefail
 
+# Log file
 LOGFILE="deploy_$(date +%Y%m%d_%H%M%S).log"
 
-# -------- Logging Helper --------
+# ------------- Helper Functions -------------
+
 log() {
   echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"
 }
@@ -19,7 +30,18 @@ error_exit() {
   exit 1
 }
 
-# -------- Step 1: Collect Parameters --------
+trap 'error_exit "Unexpected error on line $LINENO"' ERR
+
+# ------------- Parse Arguments -------------
+
+if [[ "${1:-}" == "--cleanup" ]]; then
+  CLEANUP=true
+else
+  CLEANUP=false
+fi
+
+# ------------- Step 1: Collect Parameters -------------
+
 log "🧠 Collecting deployment parameters..."
 
 read -p "Enter Git repository URL: " GIT_URL
@@ -32,13 +54,13 @@ read -p "Enter remote server IP address: " SERVER_IP
 read -p "Enter SSH key path (e.g., ~/.ssh/id_rsa): " SSH_KEY
 read -p "Enter app internal container port (e.g., 3000): " APP_PORT
 
-# -------- Validate Inputs --------
 [[ -z "$GIT_URL" || -z "$PAT" || -z "$SSH_USER" || -z "$SERVER_IP" || -z "$SSH_KEY" || -z "$APP_PORT" ]] && error_exit "Missing one or more required inputs."
 
-# -------- Step 2: Clone Repository --------
-log "📦 Cloning repository..."
+# ------------- Step 2: Clone or Update Repository -------------
 
 REPO_NAME=$(basename "$GIT_URL" .git)
+
+log "📦 Cloning or updating repository..."
 
 if [ -d "$REPO_NAME" ]; then
   log "📁 Repo exists locally. Pulling latest changes..."
@@ -49,7 +71,8 @@ else
   cd "$REPO_NAME" || error_exit "Failed to enter cloned directory."
 fi
 
-# -------- Step 3: Validate Docker Setup --------
+# ------------- Step 3: Validate Docker Configuration -------------
+
 if [ -f "Dockerfile" ]; then
   log "✅ Dockerfile found."
 elif [ -f "docker-compose.yml" ]; then
@@ -58,32 +81,52 @@ else
   error_exit "No Dockerfile or docker-compose.yml found in repo."
 fi
 
-# -------- Step 4: Test SSH Connection --------
-log "🔐 Testing SSH connectivity..."
-ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=5 "$SSH_USER@$SERVER_IP" "echo 'Connected!'" || error_exit "SSH connection failed."
+# ------------- Step 4: Test SSH Connection -------------
 
-# -------- Step 5: Prepare Remote Environment --------
+log "🔐 Testing SSH connectivity..."
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no -o BatchMode=yes -o ConnectTimeout=5 "$SSH_USER@$SERVER_IP" "echo 'SSH connection successful.'" || error_exit "SSH connection failed."
+
+# ------------- Step 5: Prepare Remote Environment -------------
+
 log "🛠️ Preparing remote server environment..."
 
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash <<EOF
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash <<EOF
   set -e
   echo "Updating system..." && sudo apt update -y
   echo "Installing Docker..." && sudo apt install -y docker.io
   echo "Installing Docker Compose..." && sudo apt install -y docker-compose
   echo "Installing Nginx..." && sudo apt install -y nginx
+  sudo usermod -aG docker $SSH_USER || true
   sudo systemctl enable docker nginx
   sudo systemctl start docker nginx
   echo "✅ Remote environment ready."
 EOF
 
-# -------- Step 6: Deploy Dockerized App --------
+# ------------- Step 6: Cleanup (if requested) -------------
+
+if [ "$CLEANUP" = true ]; then
+  log "🧹 Cleanup flag detected. Removing previous deployment..."
+  ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash <<EOF
+    sudo docker stop hng || true
+    sudo docker rm hng || true
+    sudo docker system prune -af || true
+    sudo rm -rf ~/app /etc/nginx/sites-available/hng.conf /etc/nginx/sites-enabled/hng.conf
+    sudo systemctl reload nginx || true
+  EOF
+  log "✅ Cleanup complete. Exiting."
+  exit 0
+fi
+
+# ------------- Step 7: Deploy Dockerized Application -------------
+
 log "🚀 Deploying Dockerized app..."
 
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "mkdir -p ~/app"
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "mkdir -p ~/app"
 
-rsync -avz -e "ssh -i $SSH_KEY" . "$SSH_USER@$SERVER_IP:~/app" >> "$LOGFILE" 2>&1
+rsync -avz -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=no" . "$SSH_USER@$SERVER_IP:~/app" >> "$LOGFILE" 2>&1
 
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash <<EOF
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash <<EOF
+  set -e
   cd ~/app
   if [ -f "docker-compose.yml" ]; then
     sudo docker-compose down || true
@@ -96,7 +139,8 @@ ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash <<EOF
   fi
 EOF
 
-# -------- Step 7: Configure Nginx as Reverse Proxy --------
+# ------------- Step 8: Configure Nginx Reverse Proxy -------------
+
 log "🌐 Configuring Nginx reverse proxy..."
 
 NGINX_CONF="
@@ -111,17 +155,18 @@ server {
 }
 "
 
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "echo \"$NGINX_CONF\" | sudo tee /etc/nginx/sites-available/hng.conf"
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "sudo ln -sf /etc/nginx/sites-available/hng.conf /etc/nginx/sites-enabled/hng.conf"
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" "sudo nginx -t && sudo systemctl reload nginx"
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "echo \"$NGINX_CONF\" | sudo tee /etc/nginx/sites-available/hng.conf"
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "sudo ln -sf /etc/nginx/sites-available/hng.conf /etc/nginx/sites-enabled/hng.conf"
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" "sudo nginx -t && sudo systemctl reload nginx"
 
-# -------- Step 8: Validate Deployment --------
+# ------------- Step 9: Validate Deployment -------------
+
 log "🧪 Validating deployment..."
 
-ssh -i "$SSH_KEY" "$SSH_USER@$SERVER_IP" bash <<EOF
+ssh -i "$SSH_KEY" -o StrictHostKeyChecking=no "$SSH_USER@$SERVER_IP" bash <<EOF
   sudo systemctl status docker --no-pager
   sudo docker ps
   curl -I http://localhost || echo "App may not be responding yet."
 EOF
 
-log "🎉 Deployment complete! Check your app via http://$SERVER_IP"
+log "🎉 Deployment complete! Access your app at: http://$SERVER_IP"
